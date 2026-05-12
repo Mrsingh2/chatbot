@@ -4,6 +4,7 @@ from app.ingestion import ingest_pdfs
 from app.session import create_session
 from app.chat import process_message, get_disclaimer
 from app.llm import is_ollama_available
+from app.health import run_startup_checks
 
 
 def run_terminal():
@@ -15,6 +16,7 @@ def run_terminal():
 
     print("\nInitialising chatbot - loading PDFs into vector store...")
     ingest_pdfs()
+    run_startup_checks()
     print("Done.\n")
 
     session = create_session()

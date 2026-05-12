@@ -5,6 +5,7 @@ from app.ingestion import ingest_pdfs
 from app.session import create_session, delete_session, get_session, list_sessions
 from app.chat import process_message, get_disclaimer
 from app.llm import is_ollama_available
+from app.health import run_startup_checks
 
 
 @asynccontextmanager
@@ -14,6 +15,7 @@ async def lifespan(app: FastAPI):
         print("Run: ollama serve && ollama pull llama3.1:8b")
     print("Starting up - ingesting PDFs...")
     ingest_pdfs()
+    run_startup_checks()
     print("Ready.")
     yield
 
