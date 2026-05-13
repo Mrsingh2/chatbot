@@ -2,7 +2,7 @@ from app.config import (
     SUPPORT_EMAIL, SUPPORT_PHONE, SUPPORT_URL, RAG_TOP_K,
     LLM_MODERATION_ENABLED, ENABLE_OUTPUT_VERIFICATION,
 )
-from app.llm import chat
+from app.llm import chat, chat_stream
 from app.vector_store import query as vector_query
 from app.embedder import embed_one
 from app.moderation import (
@@ -82,22 +82,25 @@ def _oos(known_topics_summary: str, support_text: str) -> str:
     return OUT_OF_SCOPE_RESPONSE.format(redirect_hint=redirect_hint, support_text=support_text)
 
 
-def answer(user_message: str, conversation_history: list[dict], known_topics_summary: str = "") -> str:
-    support_text = build_support_text()
+def _gate(user_message: str, support_text: str, known_topics_summary: str):
+    """Run moderation, predefined-QA, scope, and retrieval gates.
 
+    Returns either:
+      ("terminal", <final response string>) — caller emits and stops.
+      ("rag", <context_str>, <messages>)   — caller proceeds to LLM generation.
+    """
     if LLM_MODERATION_ENABLED:
         label = classify_moderation(user_message)
         if label == "INJECTION":
-            return INJECTION_REFUSAL.format(support_text=support_text)
+            return ("terminal", INJECTION_REFUSAL.format(support_text=support_text))
         if label == "POLITICAL":
-            return POLITICAL_REFUSAL.format(support_text=support_text)
+            return ("terminal", POLITICAL_REFUSAL.format(support_text=support_text))
         if label == "OOS":
-            return _oos(known_topics_summary, support_text)
-        # SAFE → continue
+            return ("terminal", _oos(known_topics_summary, support_text))
 
     predefined = find_best_predefined_answer(user_message)
     if predefined:
-        return predefined
+        return ("terminal", predefined)
 
     query_emb = embed_one(user_message)
     raw_chunks = vector_query(query_emb, n_results=RAG_TOP_K)
@@ -107,20 +110,32 @@ def answer(user_message: str, conversation_history: list[dict], known_topics_sum
     proto_in_scope = prototype_scope_pass(query_emb)
 
     if not corpus_in_scope and not proto_in_scope:
-        return _oos(known_topics_summary, support_text)
-
+        return ("terminal", _oos(known_topics_summary, support_text))
     if not corpus_in_scope:
-        return CONVERSATIONAL_HELP_RESPONSE
+        return ("terminal", CONVERSATIONAL_HELP_RESPONSE)
 
     context_parts = []
     for i, chunk in enumerate(relevant_chunks, 1):
         src = chunk["metadata"].get("source_file", "unknown")
         context_parts.append(f"[Context {i} | Source: {src}]\n{chunk['text']}")
-    context_str = "\n\n".join(context_parts)
+    return ("rag", "\n\n".join(context_parts))
 
+
+VERIFY_WARNING_FOOTER = (
+    "\n\n[Note: I'm not fully confident this answer is grounded in the official "
+    "data.gov.in documentation. Please verify on the portal before relying on it.]"
+)
+
+
+def answer(user_message: str, conversation_history: list[dict], known_topics_summary: str = "") -> str:
+    support_text = build_support_text()
+    decision = _gate(user_message, support_text, known_topics_summary)
+    if decision[0] == "terminal":
+        return decision[1]
+
+    context_str = decision[1]
     system = RAG_SYSTEM_PROMPT.format(support_text=support_text, context=context_str)
-    messages = list(conversation_history)
-    messages.append({"role": "user", "content": user_message})
+    messages = list(conversation_history) + [{"role": "user", "content": user_message}]
 
     try:
         response = chat(system=system, messages=messages, max_tokens=1024, temperature=0.1)
@@ -133,6 +148,40 @@ def answer(user_message: str, conversation_history: list[dict], known_topics_sum
         return _oos(known_topics_summary, support_text)
 
     return response
+
+
+def answer_stream(user_message: str, conversation_history: list[dict], known_topics_summary: str = ""):
+    """Generator version of answer(). Yields incremental string chunks.
+
+    Refusal / template responses are emitted as a single chunk. The grounded
+    RAG answer is streamed token-by-token. Because already-streamed tokens
+    cannot be retracted, the grounding verifier (if enabled) APPENDS a
+    warning footer on failure instead of replacing the answer."""
+    support_text = build_support_text()
+    decision = _gate(user_message, support_text, known_topics_summary)
+    if decision[0] == "terminal":
+        yield decision[1]
+        return
+
+    context_str = decision[1]
+    system = RAG_SYSTEM_PROMPT.format(support_text=support_text, context=context_str)
+    messages = list(conversation_history) + [{"role": "user", "content": user_message}]
+
+    accumulated: list[str] = []
+    try:
+        for chunk in chat_stream(system=system, messages=messages, max_tokens=1024, temperature=0.1):
+            accumulated.append(chunk)
+            yield chunk
+    except Exception as e:
+        print(f"LLM stream error: {e}")
+        if not accumulated:
+            yield f"I'm temporarily unable to process your request. Please try again. If the issue persists, contact: {support_text}"
+        return
+
+    if ENABLE_OUTPUT_VERIFICATION:
+        full = "".join(accumulated)
+        if not is_output_grounded(full, context_str):
+            yield VERIFY_WARNING_FOOTER
 
 
 def get_known_topics(n_sample_chunks: int = 10) -> str:

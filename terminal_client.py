@@ -2,7 +2,7 @@
 import sys
 from app.ingestion import ingest_pdfs
 from app.session import create_session
-from app.chat import process_message, get_disclaimer
+from app.chat import process_message_stream, get_disclaimer
 from app.llm import is_ollama_available
 from app.health import run_startup_checks
 
@@ -39,8 +39,10 @@ def run_terminal():
             print("Bot: Thank you for using the Government Open Data Portal assistant. Goodbye!")
             sys.exit(0)
 
-        response = process_message(session_id, user_input)
-        print(f"\nBot: {response}\n")
+        print("\nBot: ", end="", flush=True)
+        for chunk in process_message_stream(session_id, user_input):
+            print(chunk, end="", flush=True)
+        print("\n")
 
 
 if __name__ == "__main__":
