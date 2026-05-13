@@ -4,7 +4,7 @@ from app.apis import (
     search_datasets, get_cdo_details, get_dataset_cdo,
     submit_portal_feedback, contact_cdo_or_dataset_feedback,
 )
-from app.rag import answer, get_known_topics
+from app.rag import answer, answer_stream, get_known_topics
 
 DISCLAIMER_TEXT = """
 ================================================================
@@ -35,7 +35,53 @@ DISCLAIMER_REQUIRED = "Please type 'I agree' to accept the terms before we can b
 AGREEMENT_PHRASES = {"i agree", "agree", "yes", "ok", "okay", "accept", "i accept", "yes i agree"}
 
 
+_DISCLAIMER_AGREED_GREETING = (
+    "Thank you for agreeing. How can I help you today? "
+    "I can answer questions about the Government Open Data Portal, "
+    "help you search for datasets, or connect you with Chief Data Officers."
+)
+
+
+def _preamble(session, user_message: str) -> str | None:
+    """Disclaimer / empty-input handling shared by both message handlers.
+    Returns a final reply string if the turn ends here, else None to mean
+    'proceed to intent routing'."""
+    if not session.disclaimer_accepted:
+        if user_message.lower() in AGREEMENT_PHRASES:
+            accept_disclaimer(session.session_id)
+            add_to_history(session.session_id, "user", user_message)
+            add_to_history(session.session_id, "assistant", _DISCLAIMER_AGREED_GREETING)
+            return _DISCLAIMER_AGREED_GREETING
+        return DISCLAIMER_REQUIRED
+    return None
+
+
+def _route_non_rag(session, user_message: str, intent: str, extracted: str) -> str | None:
+    """Resolve non-RAG intents to their canned/API string. Returns None when
+    the intent is rag_chat (caller handles RAG)."""
+    if intent == "search":
+        return search_datasets(extracted or user_message)
+    if intent == "cdo_details":
+        return get_cdo_details(extracted or user_message)
+    if intent == "dataset_cdo_link":
+        return get_dataset_cdo(extracted or user_message)
+    if intent == "portal_feedback":
+        return submit_portal_feedback(user_message)
+    if intent == "contact_cdo":
+        return contact_cdo_or_dataset_feedback(extracted)
+    return None
+
+
+def _classify(session, user_message: str) -> tuple[str, str]:
+    recent = session.history[-4:] if len(session.history) >= 4 else session.history
+    context_str = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in recent)
+    intent_result = classify_intent(user_message, context_str)
+    return intent_result.get("intent", "rag_chat"), intent_result.get("extracted", "")
+
+
 def process_message(session_id: str, user_message: str) -> str:
+    """Non-streaming handler. Returns the full reply as a single string.
+    Kept for backwards compatibility with the existing /chat endpoint."""
     session = get_session(session_id)
     if not session:
         return "Session not found. Please start a new session."
@@ -44,36 +90,14 @@ def process_message(session_id: str, user_message: str) -> str:
     if not user_message:
         return "Please enter a message."
 
-    if not session.disclaimer_accepted:
-        if user_message.lower() in AGREEMENT_PHRASES:
-            accept_disclaimer(session_id)
-            add_to_history(session_id, "user", user_message)
-            response = (
-                "Thank you for agreeing. How can I help you today? "
-                "I can answer questions about the Government Open Data Portal, "
-                "help you search for datasets, or connect you with Chief Data Officers."
-            )
-            add_to_history(session_id, "assistant", response)
-            return response
-        return DISCLAIMER_REQUIRED
+    preamble = _preamble(session, user_message)
+    if preamble is not None:
+        return preamble
 
-    recent = session.history[-4:] if len(session.history) >= 4 else session.history
-    context_str = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in recent)
-
-    intent_result = classify_intent(user_message, context_str)
-    intent = intent_result.get("intent", "rag_chat")
-    extracted = intent_result.get("extracted", "")
-
-    if intent == "search":
-        response = search_datasets(extracted or user_message)
-    elif intent == "cdo_details":
-        response = get_cdo_details(extracted or user_message)
-    elif intent == "dataset_cdo_link":
-        response = get_dataset_cdo(extracted or user_message)
-    elif intent == "portal_feedback":
-        response = submit_portal_feedback(user_message)
-    elif intent == "contact_cdo":
-        response = contact_cdo_or_dataset_feedback(extracted)
+    intent, extracted = _classify(session, user_message)
+    routed = _route_non_rag(session, user_message, intent, extracted)
+    if routed is not None:
+        response = routed
     else:
         known_topics = get_known_topics()
         history_for_rag = [m for m in session.history if m["role"] in ("user", "assistant")]
@@ -82,6 +106,47 @@ def process_message(session_id: str, user_message: str) -> str:
     add_to_history(session_id, "user", user_message)
     add_to_history(session_id, "assistant", response)
     return response
+
+
+def process_message_stream(session_id: str, user_message: str):
+    """Streaming handler. Yields string chunks as they become available.
+
+    Refusals / template / API responses are emitted as a single chunk.
+    The grounded RAG answer streams token-by-token from Ollama. The full
+    accumulated response is written to history at the end of the turn."""
+    session = get_session(session_id)
+    if not session:
+        yield "Session not found. Please start a new session."
+        return
+
+    user_message = user_message.strip()
+    if not user_message:
+        yield "Please enter a message."
+        return
+
+    preamble = _preamble(session, user_message)
+    if preamble is not None:
+        yield preamble
+        return
+
+    intent, extracted = _classify(session, user_message)
+    routed = _route_non_rag(session, user_message, intent, extracted)
+    if routed is not None:
+        add_to_history(session_id, "user", user_message)
+        add_to_history(session_id, "assistant", routed)
+        yield routed
+        return
+
+    known_topics = get_known_topics()
+    history_for_rag = [m for m in session.history if m["role"] in ("user", "assistant")]
+    chunks: list[str] = []
+    for chunk in answer_stream(user_message, history_for_rag, known_topics):
+        chunks.append(chunk)
+        yield chunk
+
+    response = "".join(chunks)
+    add_to_history(session_id, "user", user_message)
+    add_to_history(session_id, "assistant", response)
 
 
 def get_disclaimer() -> str:

@@ -1,9 +1,11 @@
+import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from app.ingestion import ingest_pdfs
 from app.session import create_session, delete_session, get_session, list_sessions
-from app.chat import process_message, get_disclaimer
+from app.chat import process_message, process_message_stream, get_disclaimer
 from app.llm import is_ollama_available
 from app.health import run_startup_checks
 
@@ -69,6 +71,34 @@ def chat(session_id: str, request: ChatRequest):
         session_id=session_id,
         response=response,
         disclaimer_accepted=session.disclaimer_accepted,
+    )
+
+
+@app.post("/chat/{session_id}/stream")
+def chat_stream(session_id: str, request: ChatRequest):
+    """Server-Sent Events stream. Each event is a JSON line of the form
+    `data: {"chunk": "..."}` followed by a final `data: {"done": true}`.
+
+    The grounded RAG answer streams token-by-token. Refusals, templates,
+    and mocked API responses arrive as a single chunk. Disconnects are
+    safe — history is only persisted at end-of-stream.
+    """
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found. Create one via POST /session/create")
+
+    def event_gen():
+        try:
+            for chunk in process_message_stream(session_id, request.message):
+                yield f"data: {json.dumps({'chunk': chunk}, ensure_ascii=False)}\n\n"
+            yield 'data: {"done": true}\n\n'
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

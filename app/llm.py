@@ -52,6 +52,31 @@ def chat(
     return response["message"]["content"].strip()
 
 
+def chat_stream(
+    system: str,
+    messages: list[dict],
+    max_tokens: int = 1024,
+    temperature: float = 0.1,
+    model: str | None = None,
+    keep_alive: str | None = None,
+):
+    """Streaming version of chat(). Yields incremental content strings as the
+    MAIN model produces tokens. Caller is responsible for accumulating if
+    they also need the full string."""
+    client = _get_client()
+    stream = client.chat(
+        model=model or OLLAMA_MODEL,
+        messages=[{"role": "system", "content": system}] + messages,
+        options=_options(temperature, max_tokens, num_ctx=OLLAMA_NUM_CTX),
+        keep_alive=keep_alive or OLLAMA_KEEP_ALIVE,
+        stream=True,
+    )
+    for part in stream:
+        content = part.get("message", {}).get("content", "")
+        if content:
+            yield content
+
+
 def complete(
     prompt: str,
     max_tokens: int = 200,
